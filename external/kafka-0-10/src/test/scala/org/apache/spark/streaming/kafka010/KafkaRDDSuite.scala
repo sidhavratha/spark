@@ -17,38 +17,54 @@
 
 package org.apache.spark.streaming.kafka010
 
-import java.{ util => ju }
+import java.{util => ju}
 
 import scala.collection.JavaConverters._
 import scala.util.Random
-
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.serialization.StringDeserializer
 import org.scalatest.BeforeAndAfterAll
-
 import org.apache.spark._
 import org.apache.spark.scheduler.ExecutorCacheTaskLocation
+import org.apache.spark.streaming.kafka010.consumer.async.AsyncSparkKafkaConsumerBuilder
 
 class KafkaRDDSuite extends SparkFunSuite with BeforeAndAfterAll {
 
   private var kafkaTestUtils: KafkaTestUtils = _
 
-  private val sparkConf = new SparkConf().setMaster("local[4]")
-    .setAppName(this.getClass.getSimpleName)
-  private var sc: SparkContext = _
+  private val sparkConfList = List(
+    (
+      "Sync Kafka Consumer",
+      new SparkConf().setMaster("local[4]").setAppName(this.getClass.getSimpleName)
+        .set("spark.streaming.kafka.consumer.poll.ms", "10000")
+    ),
+    (
+      "Async Kafka Consumer with default settings",
+      new SparkConf().setMaster("local[4]").setAppName(this.getClass.getSimpleName)
+        .set("spark.streaming.kafka.consumer.poll.ms", "10000")
+        .set(
+          "spark.streaming.kafka.consumer.builder.name",
+          classOf[AsyncSparkKafkaConsumerBuilder[_, _]].getCanonicalName
+        )
+    ),
+    (
+      "Async Kafka Consumer with buffer",
+      new SparkConf().setMaster("local[4]").setAppName(this.getClass.getSimpleName)
+        .set("spark.streaming.kafka.consumer.poll.ms", "10000")
+        .set(
+          "spark.streaming.kafka.consumer.builder.name",
+          classOf[AsyncSparkKafkaConsumerBuilder[_, _]].getCanonicalName
+        )
+        .set("spark.streaming.kafka.consumer.builder.config.maintainBufferMin", 10.toString)
+    )
+  )
 
   override def beforeAll {
-    sc = new SparkContext(sparkConf)
     kafkaTestUtils = new KafkaTestUtils
     kafkaTestUtils.setup()
   }
 
   override def afterAll {
-    if (sc != null) {
-      sc.stop
-      sc = null
-    }
-
     if (kafkaTestUtils != null) {
       kafkaTestUtils.teardown()
       kafkaTestUtils = null
@@ -59,12 +75,29 @@ class KafkaRDDSuite extends SparkFunSuite with BeforeAndAfterAll {
     "bootstrap.servers" -> kafkaTestUtils.brokerAddress,
     "key.deserializer" -> classOf[StringDeserializer],
     "value.deserializer" -> classOf[StringDeserializer],
-    "group.id" -> s"test-consumer-${Random.nextInt}-${System.currentTimeMillis}"
+    "group.id" -> s"test-consumer-${Random.nextInt}-${System.currentTimeMillis}",
+    "max.poll.records" -> 2.asInstanceOf[Object]
   ).asJava
 
   private val preferredHosts = LocationStrategies.PreferConsistent
 
   test("basic usage") {
+    sparkConfList.foreach { sparkConf =>
+      var testName = sparkConf._1
+      val suiteName = this.getClass.getName
+      val shortSuiteName = suiteName.replaceAll("org.apache.spark", "o.a.s")
+      var sc = new SparkContext(sparkConf._2)
+      try {
+        logInfo(s"\n\n===== TEST OUTPUT FOR $shortSuiteName: '$testName' =====\n")
+        testBasicUsage(sc)
+      } finally {
+        logInfo(s"\n\n===== FINISHED $shortSuiteName: '$testName' =====\n")
+        sc.stop()
+      }
+    }
+  }
+
+  def testBasicUsage(sc: SparkContext): Unit = {
     val topic = s"topicbasic-${Random.nextInt}-${System.currentTimeMillis}"
     kafkaTestUtils.createTopic(topic)
     val messages = Array("the", "quick", "brown", "fox")
@@ -103,6 +136,22 @@ class KafkaRDDSuite extends SparkFunSuite with BeforeAndAfterAll {
   }
 
   test("iterator boundary conditions") {
+    sparkConfList.foreach { sparkConf =>
+      var testName = sparkConf._1
+      val suiteName = this.getClass.getName
+      val shortSuiteName = suiteName.replaceAll("org.apache.spark", "o.a.s")
+      var sc = new SparkContext(sparkConf._2)
+      try {
+        logInfo(s"\n\n===== TEST OUTPUT FOR $shortSuiteName: '$testName' =====\n")
+        testIteratorBoundaryConsiditions(sc)
+      } finally {
+        logInfo(s"\n\n===== FINISHED $shortSuiteName: '$testName' =====\n")
+        sc.stop()
+      }
+    }
+  }
+
+  def testIteratorBoundaryConsiditions(sc: SparkContext): Unit = {
     // the idea is to find e.g. off-by-one errors between what kafka has available and the rdd
     val topic = s"topicboundary-${Random.nextInt}-${System.currentTimeMillis}"
     val sent = Map("a" -> 5, "b" -> 3, "c" -> 10)
@@ -147,6 +196,22 @@ class KafkaRDDSuite extends SparkFunSuite with BeforeAndAfterAll {
   }
 
   test("executor sorting") {
+    sparkConfList.foreach { sparkConf =>
+      var testName = sparkConf._1
+      val suiteName = this.getClass.getName
+      val shortSuiteName = suiteName.replaceAll("org.apache.spark", "o.a.s")
+      var sc = new SparkContext(sparkConf._2)
+      try {
+        logInfo(s"\n\n===== TEST OUTPUT FOR $shortSuiteName: '$testName' =====\n")
+        testExecutorSorting(sc)
+      } finally {
+        logInfo(s"\n\n===== FINISHED $shortSuiteName: '$testName' =====\n")
+        sc.stop()
+      }
+    }
+  }
+
+  def testExecutorSorting(sc: SparkContext): Unit = {
     val kafkaParams = new ju.HashMap[String, Object](getKafkaParams())
     kafkaParams.put("auto.offset.reset", "none")
     val rdd = new KafkaRDD[String, String](
