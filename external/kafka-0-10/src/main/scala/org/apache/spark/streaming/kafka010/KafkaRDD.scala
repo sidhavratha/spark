@@ -17,7 +17,7 @@
 
 package org.apache.spark.streaming.kafka010
 
-import java.{ util => ju }
+import java.{util => ju}
 
 import scala.collection.mutable.ArrayBuffer
 
@@ -30,6 +30,9 @@ import org.apache.spark.partial.{BoundedDouble, PartialResult}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.scheduler.ExecutorCacheTaskLocation
 import org.apache.spark.storage.StorageLevel
+import org.apache.spark.streaming.kafka010.consumer.{SparkKafkaConsumer, SparkKafkaConsumerBuilder}
+import org.apache.spark.streaming.kafka010.consumer.sync.SyncSparkKafkaConsumerBuilder
+import org.apache.spark.util.Utils
 
 /**
  * A batch-oriented interface for consuming from Kafka.
@@ -74,6 +77,15 @@ private[spark] class KafkaRDD[K, V](
     conf.getInt("spark.streaming.kafka.consumer.cache.maxCapacity", 64)
   private val cacheLoadFactor =
     conf.getDouble("spark.streaming.kafka.consumer.cache.loadFactor", 0.75).toFloat
+
+  private val defaultConsumerBuilder: String =
+    classOf[SyncSparkKafkaConsumerBuilder[_, _]].getCanonicalName
+  private val consumerBuilder = conf.get("spark.streaming.kafka.consumer.builder.name",
+    defaultConsumerBuilder)
+  private val consumerBuilderConfs =
+    conf.getAllWithPrefix("spark.streaming.kafka.consumer.builder.config.")
+
+
 
   override def persist(newLevel: StorageLevel): this.type = {
     logError("Kafka ConsumerRecord is not serializable. " +
@@ -183,8 +195,26 @@ private[spark] class KafkaRDD[K, V](
         s"skipping ${part.topic} ${part.partition}")
       Iterator.empty
     } else {
-      new KafkaRDDIterator(part, context)
+      val consumerBuilderConfig: ju.Map[String, String] = new ju.HashMap[String, String]
+      consumerBuilderConfs.foreach(r => consumerBuilderConfig.put(r._1, r._2))
+      var consumerInstance = Utils.classForName(getValidConsumerBuilder)
+        .newInstance().asInstanceOf[SparkKafkaConsumerBuilder[K, V]]
+        .init(part.topicPartition(), kafkaParams, consumerBuilderConfig, pollTimeout)
+      new KafkaRDDIterator(part, context, consumerInstance)
     }
+  }
+
+  private def getValidConsumerBuilder(): String = {
+    var builder: String = defaultConsumerBuilder;
+    try {
+      builder = Utils.classForName(consumerBuilder).getCanonicalName
+    } catch {
+      case x: Exception =>
+        logError(s"Error finding consumerBuilder $consumerBuilder $x. " +
+          "Defaulting to " + defaultConsumerBuilder
+        )
+    }
+    builder
   }
 
   /**
@@ -193,7 +223,8 @@ private[spark] class KafkaRDD[K, V](
    */
   private class KafkaRDDIterator(
       part: KafkaRDDPartition,
-      context: TaskContext) extends Iterator[ConsumerRecord[K, V]] {
+      context: TaskContext,
+      sparkKafkaConsumer: SparkKafkaConsumer[K, V]) extends Iterator[ConsumerRecord[K, V]] {
 
     logInfo(s"Computing topic ${part.topic}, partition ${part.partition} " +
       s"offsets ${part.fromOffset} -> ${part.untilOffset}")
@@ -205,12 +236,16 @@ private[spark] class KafkaRDD[K, V](
     val consumer = if (useConsumerCache) {
       CachedKafkaConsumer.init(cacheInitialCapacity, cacheMaxCapacity, cacheLoadFactor)
       if (context.attemptNumber > 1) {
-        // just in case the prior attempt failures were cache related
+        // justin case the prior attempt failures were cache related
         CachedKafkaConsumer.remove(groupId, part.topic, part.partition)
       }
-      CachedKafkaConsumer.get[K, V](groupId, part.topic, part.partition, kafkaParams)
+      CachedKafkaConsumer.get[K, V](
+        groupId, part.topic, part.partition, kafkaParams, sparkKafkaConsumer
+      )
     } else {
-      CachedKafkaConsumer.getUncached[K, V](groupId, part.topic, part.partition, kafkaParams)
+      CachedKafkaConsumer.getUncached[K, V](
+        groupId, part.topic, part.partition, kafkaParams, sparkKafkaConsumer
+      )
     }
 
     var requestOffset = part.fromOffset
@@ -225,7 +260,7 @@ private[spark] class KafkaRDD[K, V](
 
     override def next(): ConsumerRecord[K, V] = {
       assert(hasNext(), "Can't call getNext() once untilOffset has been reached")
-      val r = consumer.get(requestOffset, pollTimeout)
+      val r = consumer.get(requestOffset)
       requestOffset += 1
       r
     }
